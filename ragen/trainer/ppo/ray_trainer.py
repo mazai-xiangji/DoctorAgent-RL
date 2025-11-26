@@ -726,8 +726,13 @@ class RayPPOTrainer(object):
         # create env_llm worker
         if self.config.env.use_env_llm:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.EnvLLM)
+            # 判断使用哪份配置
+            if self.config.env.get('use_api_for_env', False):
+                worker_config = self.config.env.api_config
+            else:
+                worker_config = self.config.env.env_llm
             env_llm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.EnvLLM], 
-                                            config=self.config.env.env_llm,
+                                            config=worker_config,
                                             role='env_llm')
             self.resource_pool_to_cls[resource_pool]['env_llm'] = env_llm_cls
 

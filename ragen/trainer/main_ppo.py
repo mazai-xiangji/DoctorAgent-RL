@@ -211,6 +211,7 @@ def main_task(config):
 
     from ragen.trainer.ppo.ray_trainer import ResourcePoolManager, Role
     from ragen.workers.env_llm_worker import EnvironmentLLMWorker
+    from ragen.workers.api_env_worker import APIEnvironmentLLMWorker
 
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
@@ -229,7 +230,11 @@ def main_task(config):
     }
 
     if config.env.use_env_llm:
-        role_worker_mapping[Role.EnvLLM] = ray.remote(EnvironmentLLMWorker)
+        use_api=config.env.get('use_api_for_env',False)
+        if use_api:
+             role_worker_mapping[Role.EnvLLM] = ray.remote(APIEnvironmentLLMWorker)
+        else:
+            role_worker_mapping[Role.EnvLLM] = ray.remote(EnvironmentLLMWorker)
         mapping[Role.EnvLLM] = global_pool_id
 
     # we should adopt a multi-source reward function here

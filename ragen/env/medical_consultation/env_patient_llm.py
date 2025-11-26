@@ -25,7 +25,7 @@ class MedicalConsultationEnvWithPatientLLM(MedicalConsultationEnv):
 
     PENALTY_FOR_INVALID = 0
 
-    def __init__(self, parquet_path: str, env_llm_worker=None, tokenizer=None, max_turns=5):
+    def __init__(self, parquet_path: str, env_llm_worker=None, tokenizer=None, max_turns=5,use_api=True):
         """
         Initialize the environment for Medical Consultation
 
@@ -40,10 +40,95 @@ class MedicalConsultationEnvWithPatientLLM(MedicalConsultationEnv):
         else:
             self.random_turn = False
         super().__init__(parquet_path, env_llm_worker, tokenizer, max_turns)
+        self.use_api=use_api
         self.description = None
         self.diagnosis_score = None
         self.recommandation_score = None
 
+    def step(self, action: str) -> Tuple[str, float, bool, Dict]:
+        """
+        Execute one step in the environment.
+        Overridden to support API-based Patient Agent.
+        """
+        if self.diagnosis_made:
+            return self.render(), 0, True, {"action_is_effective": False}
+        
+        reward = -0.5  # Penalty for each turn
+        self.current_turn += 1
+            
+        # Check if the action is a diagnosis
+        # (这里逻辑与父类一致，处理诊断并计算 ROUGE 分数)
+        if "<diagnosis>" in action: # 注意：原代码这里可能有变动，请根据你的 Prompt 模板调整匹配逻辑
+            diagnosis_match = re.search(r"<diagnosis>(.*?)</diagnosis>", action, re.DOTALL)
+            if diagnosis_match:
+                diagnosis = diagnosis_match.group(1).strip()
+                self.diagnosis_made = True
+                # GT diagnosis
+                gt_diagnosis = self._shared_data[self.index]['target']['diagnosis']
+                similarity = self._get_rouge_score(diagnosis, gt_diagnosis)
+                reward = similarity * 10
+
+                gt_suggestion = self._shared_data[self.index]['target']['recommendation']
+                if len(gt_suggestion) > 0:
+                    suggestion_match = re.search(r"<recommendation>(.*?)</recommendation>", action, re.DOTALL)
+                    if suggestion_match:
+                        suggestion = suggestion_match.group(1).strip()
+                        similarity = self._get_rouge_score(suggestion, gt_suggestion)
+                        reward += similarity * 5
+
+                return self.render(), reward, True, {"action_is_effective": True}
+        
+        patient_response = None
+        question_idx = -1
+        
+        if self.env_llm_worker:
+            prompt = self._prepare_patient_prompt(action)
+            llm_response = ""
+
+            if getattr(self, 'use_api', False): # 检查是否有 use_api 标志
+                # === API 模式 ===
+                # API worker 接受 list[str] 并返回 list[str]
+                response_list = ray.get(self.env_llm_worker.generate_responses.remote([prompt]))
+                llm_response = response_list[0]
+            else:
+                # === 本地 vLLM 模式 (原有逻辑) ===
+                if self.tokenizer:
+                    prompt_data = DataProto.from_dict({
+                        'input_ids': self.tokenizer(prompt, return_tensors='pt')['input_ids'],
+                        'attention_mask': self.tokenizer(prompt, return_tensors='pt')['attention_mask']
+                    })
+                    response_data = ray.get(self.env_llm_worker.generate_responses.remote(prompt_data))
+                    llm_response = self.tokenizer.decode(response_data.batch['responses'][0], skip_special_tokens=True)
+            
+            # 后处理逻辑保持不变
+            if "\nassistant\n" in llm_response:
+                llm_response = llm_response.split("\nassistant\n")[1].strip()
+            
+            answer_match = re.search(r"<answer>(-?\d+)</answer>", llm_response, re.DOTALL)
+            if answer_match:
+                question_idx = int(answer_match.group(1))
+                if question_idx >= 0 and self.candidate_questions is not None and question_idx < len(self.candidate_questions):
+                    if question_idx not in self.visited_questions:
+                        reward += 1.0
+                        self.visited_questions.append(question_idx)
+                    else:
+                        reward -= 1.0
+                    patient_response = " ".join(self.candidate_questions[question_idx]["patient_response"])
+                else:
+                    patient_response = "Sorry, I don't have the information to answer this question."
+            else:
+                # Fallback logic
+                patient_response = llm_response if "Sorry" not in llm_response else "Sorry, I don't know."
+        else:
+            patient_response = self._get_fallback_response(action)
+            
+        self.conversation_history.append({"role": "doctor", "content": action})
+        self.conversation_history.append({"role": "patient", "content": patient_response})
+        
+        done = self.current_turn >= self.max_turns
+        
+        return self.render(), reward, done, {"action_is_effective": True}
+    
     @staticmethod
     def _get_data_from_parquet(path: str):
         """
@@ -483,33 +568,37 @@ Your self-report states: {self.description}
             for env, action in zip(llm_envs, llm_actions):
                 prompt = env._prepare_judge_prompt(action)
                 batch_prompts.append(prompt)
+            batch_texts = []
+            if llm_envs[0].use_api:
+                batch_texts = ray.get(llm_envs[0].env_llm_worker.generate_responses.remote(batch_prompts))
             
-            # 创建批量 DataProto
-            tokenizer.padding_side = 'left'
-            batch_encodings = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors='pt')
+            else:
+                # 创建批量 DataProto
+                tokenizer.padding_side = 'left'
+                batch_encodings = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors='pt')
 
-            # Compute position_ids from attention_mask
-            position_ids = compute_position_id_with_mask(batch_encodings['attention_mask'])
+                # Compute position_ids from attention_mask
+                position_ids = compute_position_id_with_mask(batch_encodings['attention_mask'])
 
-            batch_data = DataProto.from_dict({
-                'input_ids': batch_encodings['input_ids'],
-                'attention_mask': batch_encodings['attention_mask'],
-                'position_ids': position_ids
-            })
-            batch_data.meta_info = {
-                'eos_token_id': tokenizer.eos_token_id,
-                'pad_token_id': tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': False,
-                'validate': True,
-            }
-            # 处理GPU填充
-            batch_responses = cls._handle_gpu_padding(llm_envs[0].env_llm_worker, batch_data)
-            for k, v in batch_responses.batch.items():
-                if isinstance(v, torch.Tensor):
-                    if v.dtype != torch.int64:
-                        batch_responses.batch[k] = v.to(torch.int64)
-            batch_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in batch_responses.batch['responses']]
+                batch_data = DataProto.from_dict({
+                    'input_ids': batch_encodings['input_ids'],
+                    'attention_mask': batch_encodings['attention_mask'],
+                    'position_ids': position_ids
+                })
+                batch_data.meta_info = {
+                    'eos_token_id': tokenizer.eos_token_id,
+                    'pad_token_id': tokenizer.pad_token_id,
+                    'recompute_log_prob': False,
+                    'do_sample': False,
+                    'validate': True,
+                }
+                # 处理GPU填充
+                batch_responses = cls._handle_gpu_padding(llm_envs[0].env_llm_worker, batch_data)
+                for k, v in batch_responses.batch.items():
+                    if isinstance(v, torch.Tensor):
+                        if v.dtype != torch.int64:
+                            batch_responses.batch[k] = v.to(torch.int64)
+                batch_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in batch_responses.batch['responses']]
 
             llm_envs_valid = []
             llm_actions_valid = []
@@ -554,33 +643,38 @@ Your self-report states: {self.description}
             for env, action in zip(llm_envs, llm_actions):
                 prompt = env._prepare_patient_prompt(action)
                 batch_prompts.append(prompt)
+            if not batch_prompts:
+                batch_texts=[]
+            elif llm_envs[0].use_api:
+                batch_texts = ray.get(llm_envs[0].env_llm_worker.generate_responses.remote(batch_prompts))
+            else:
             
-            # 创建批量 DataProto
-            tokenizer.padding_side = 'left'
-            batch_encodings = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors='pt')
+                # 创建批量 DataProto
+                tokenizer.padding_side = 'left'
+                batch_encodings = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors='pt')
 
-            # Compute position_ids from attention_mask
-            position_ids = compute_position_id_with_mask(batch_encodings['attention_mask'])
+                # Compute position_ids from attention_mask
+                position_ids = compute_position_id_with_mask(batch_encodings['attention_mask'])
 
-            batch_data = DataProto.from_dict({
-                'input_ids': batch_encodings['input_ids'],
-                'attention_mask': batch_encodings['attention_mask'],
-                'position_ids': position_ids
-            })
-            batch_data.meta_info = {
-                'eos_token_id': tokenizer.eos_token_id,
-                'pad_token_id': tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': False,
-                'validate': True,
-            }
-            # 处理GPU填充
-            batch_responses = cls._handle_gpu_padding(llm_envs[0].env_llm_worker, batch_data)
-            for k, v in batch_responses.batch.items():
-                if isinstance(v, torch.Tensor):
-                    if v.dtype != torch.int64:
-                        batch_responses.batch[k] = v.to(torch.int64)
-            batch_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in batch_responses.batch['responses']]
+                batch_data = DataProto.from_dict({
+                    'input_ids': batch_encodings['input_ids'],
+                    'attention_mask': batch_encodings['attention_mask'],
+                    'position_ids': position_ids
+                })
+                batch_data.meta_info = {
+                    'eos_token_id': tokenizer.eos_token_id,
+                    'pad_token_id': tokenizer.pad_token_id,
+                    'recompute_log_prob': False,
+                    'do_sample': False,
+                    'validate': True,
+                }
+                # 处理GPU填充
+                batch_responses = cls._handle_gpu_padding(llm_envs[0].env_llm_worker, batch_data)
+                for k, v in batch_responses.batch.items():
+                    if isinstance(v, torch.Tensor):
+                        if v.dtype != torch.int64:
+                            batch_responses.batch[k] = v.to(torch.int64)
+                batch_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in batch_responses.batch['responses']]
             
             # 处理每个环境的响应
             for i, (env_idx, response_text) in enumerate(zip(llm_indices, batch_texts)):

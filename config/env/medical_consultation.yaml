@@ -1,6 +1,15 @@
 env:
   name: "medical_consultation"
   use_env_llm: true  # 启用环境LLM
+  #新增API配置部分
+  use_api_for_env: true  # <--- 开关：设置为 true 使用 API，false 使用本地 vLLM
+  api_config:
+    base_url: "https://api.deepseek.com/v1" # 替换为你的 base_url
+    api_key: "sk-xxxxxx"                    # 替换为你的 key，或者从环境变量读取
+    model: "deepseek-chat"
+    temperature: 0.6
+    max_tokens: 512
+    concurrency: 32  # 这里的并发数决定了 rollout 时的速度
   train_path: "data/medical_consultation/train_tr1.parquet"  # 替换成你的训练数据路径
   val_path: "data/medical_consultation/val_tr1.parquet"      # 替换成你的验证数据路径
   env_kwargs:

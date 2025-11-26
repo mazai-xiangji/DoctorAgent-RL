@@ -81,7 +81,7 @@ def get_train_val_env(env_class, config: dict):
         # Initialize environment LLM worker if needed
         env_llm_worker = None
         tokenizer = None
-        
+        use_api = config.env.get('use_api_for_env', False) 
         if config.env.get('use_env_llm', False):
             from ragen.workers.env_llm_worker import EnvironmentLLMWorker
             from transformers import AutoTokenizer
@@ -103,14 +103,16 @@ def get_train_val_env(env_class, config: dict):
             parquet_path=config.data.train_files,
             env_llm_worker=env_llm_worker,
             tokenizer=tokenizer,
-            max_turns=config.env.get('max_turns', 5)
+            max_turns=config.env.get('max_turns', 5),
+            use_api=use_api
         )
         
         val_env = env_class(
             parquet_path=config.data.val_files,
             env_llm_worker=env_llm_worker,
             tokenizer=tokenizer,
-            max_turns=config.env.get('max_turns', 5)
+            max_turns=config.env.get('max_turns', 5),
+            use_api=use_api
         )
     else:
         raise ValueError(f"Environment {config.env.name} not supported")
