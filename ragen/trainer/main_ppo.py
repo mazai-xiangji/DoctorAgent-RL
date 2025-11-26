@@ -220,6 +220,7 @@ def main_task(config):
     }
 
     global_pool_id = 'global_pool'
+    env_pool_id='env_pool'
     resource_pool_spec = {
         global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
     }
@@ -234,9 +235,12 @@ def main_task(config):
         use_api = True
         if use_api:
             role_worker_mapping[Role.EnvLLM] = ray.remote(APIEnvironmentLLMWorker)
+            resource_pool_spec[env_pool_id] = [1] * config.trainer.nnodes
+            mapping[Role.EnvLLM] = env_pool_id
+
         else:
             role_worker_mapping[Role.EnvLLM] = ray.remote(EnvironmentLLMWorker)
-        mapping[Role.EnvLLM] = global_pool_id
+            mapping[Role.EnvLLM] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score

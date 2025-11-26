@@ -91,8 +91,11 @@ class ResourcePoolManager:
             # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
             # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
             # For Megatron backend, we recommend using max_colocate_count>1 that can utilize different WorkerGroup for differnt models
+            use_gpu = True
+            if resource_pool_name == 'env_pool':
+                use_gpu = False
             resource_pool = RayResourcePool(process_on_nodes=process_on_nodes,
-                                            use_gpu=True,
+                                            use_gpu=use_gpu,
                                             max_colocate_count=1,
                                             name_prefix=resource_pool_name)
             self.resource_pool_dict[resource_pool_name] = resource_pool

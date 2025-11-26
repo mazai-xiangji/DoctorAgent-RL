@@ -6,10 +6,11 @@ import concurrent.futures
 
 logger = logging.getLogger(__name__)
 
-@ray.remote
+
 class APIEnvironmentLLMWorker:
-    def __init__(self, config):
+    def __init__(self, config,role=None):
         self.config = config
+        self.role=role
         # 初始化 OpenAI 客户端
         self.client = OpenAI(
             base_url=config.get("base_url"),
