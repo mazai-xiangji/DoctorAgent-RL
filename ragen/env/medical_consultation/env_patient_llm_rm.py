@@ -37,7 +37,7 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
     UNKNOWN_RESPONSE_PENALTY = -1.0
     VALID_RESPONSE_REWARD = 1.0
 
-    def __init__(self, parquet_path: str, env_llm_worker=None, tokenizer=None, max_turns=5):
+    def __init__(self, parquet_path: str, env_llm_worker=None, tokenizer=None, max_turns=5,use_api=False):
         """
         Initialize the environment for Medical Consultation
 
@@ -51,7 +51,7 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
             self.random_turn = True
         else:
             self.random_turn = False
-        super().__init__(parquet_path, env_llm_worker, tokenizer, max_turns)
+        super().__init__(parquet_path, env_llm_worker, tokenizer, max_turns,use_api=use_api)
         self.description = None
         self.diagnosis_score = None
         self.recommandation_score = None
@@ -65,7 +65,8 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
             parquet_path=self.parquet_path,
             env_llm_worker=self.env_llm_worker,
             tokenizer=self.tokenizer,
-            max_turns=self.max_turns
+            max_turns=self.max_turns,
+            use_api=getattr(self, 'use_api', False)
         )
         
         # 只复制实例特定的数据
