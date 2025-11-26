@@ -230,9 +230,10 @@ def main_task(config):
     }
 
     if config.env.use_env_llm:
-        use_api=config.env.get('use_api_for_env',False)
+        # use_api=config.env.get('use_api_for_env',False)
+        use_api = True
         if use_api:
-             role_worker_mapping[Role.EnvLLM] = ray.remote(APIEnvironmentLLMWorker)
+            role_worker_mapping[Role.EnvLLM] = ray.remote(APIEnvironmentLLMWorker)
         else:
             role_worker_mapping[Role.EnvLLM] = ray.remote(EnvironmentLLMWorker)
         mapping[Role.EnvLLM] = global_pool_id
