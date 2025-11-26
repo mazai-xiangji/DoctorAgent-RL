@@ -85,7 +85,7 @@ class MedicalConsultationEnvWithPatientLLM(MedicalConsultationEnv):
             prompt = self._prepare_patient_prompt(action)
             llm_response = ""
 
-            if getattr(self, 'use_api', False): # 检查是否有 use_api 标志
+            if getattr(self, 'use_api', True): # 检查是否有 use_api 标志
                 # === API 模式 ===
                 # API worker 接受 list[str] 并返回 list[str]
                 response_list = ray.get(self.env_llm_worker.generate_responses.remote([prompt]))
