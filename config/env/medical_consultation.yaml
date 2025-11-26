@@ -9,9 +9,9 @@ env:
     model: "deepseek-chat"
     temperature: 0.6
     max_tokens: 512
-    concurrency: 32  # 这里的并发数决定了 rollout 时的速度
-  train_path: "data/medical_consultation/train_tr1.parquet"  # 替换成你的训练数据路径
-  val_path: "data/medical_consultation/val_tr1.parquet"      # 替换成你的验证数据路径
+    concurrency: 4  # 这里的并发数决定了 rollout 时的速度
+  train_path: "/home/mdisk2/ljx_new/DoctorRL_Data/MTMedDialog_RL.parquet"  # 替换成你的训练数据路径
+  val_path: "/home/mdisk2/ljx_new/DoctorRL_Data/MTMedDialog_RL.parquet"      # 替换成你的验证数据路径
   env_kwargs:
     max_turns: 5
   env_llm:
