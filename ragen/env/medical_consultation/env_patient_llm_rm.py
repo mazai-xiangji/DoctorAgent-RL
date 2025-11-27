@@ -401,10 +401,28 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
         return next_obs, dones
 
     @classmethod
-    def _batch_llm_inference(cls, llm_worker, tokenizer, prompts: List[str]):
-        """Performs batch inference using the LLM worker."""
+    def _batch_llm_inference(cls, llm_worker, tokenizer, prompts: List[Any]):
+        """Helper to handle batch inference for both API and vLLM."""
+        # 尝试使用 API 方式 (DataProto non_tensor)
+        try:
+            batch_data = DataProto.from_dict(non_tensor_batch={'prompts': np.array(prompts, dtype=object)})
+            output = llm_worker.generate_responses(batch_data)
+            # 检查是否包含 API 返回的 responses
+            if output.non_tensor_batch.get('responses') is not None:
+                return output.non_tensor_batch['responses'].tolist()
+        except Exception:
+            pass # 如果失败，尝试 vLLM 逻辑
+
+        # vLLM 逻辑 (Tokenization)
+        str_prompts = []
+        for p in prompts:
+            if isinstance(p, list): # messages format
+                str_prompts.append(tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True))
+            else:
+                str_prompts.append(str(p))
+                
         tokenizer.padding_side = 'left'
-        batch_encodings = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
+        batch_encodings = tokenizer(str_prompts, padding=True, truncation=True, return_tensors='pt')
         position_ids = compute_position_id_with_mask(batch_encodings['attention_mask'])
         batch_data = DataProto.from_dict({
             'input_ids': batch_encodings['input_ids'],
@@ -418,6 +436,8 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
             'do_sample': False,
             'validate': True,
         }
+        
+        # 调用父类或此类中定义的 _handle_gpu_padding
         batch_responses = cls._handle_gpu_padding(llm_worker, batch_data)
         for k, v in batch_responses.batch.items():
             if isinstance(v, torch.Tensor) and v.dtype != torch.int64:

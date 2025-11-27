@@ -88,8 +88,11 @@ class MedicalConsultationEnvWithPatientLLM(MedicalConsultationEnv):
             if getattr(self, 'use_api', True): # 检查是否有 use_api 标志
                 # === API 模式 ===
                 # API worker 接受 list[str] 并返回 list[str]
-                response_list = ray.get(self.env_llm_worker.generate_responses.remote([prompt]))
-                llm_response = response_list[0]
+                prompt_data = DataProto.from_dict(non_tensor_batch={'prompts': np.array([prompt], dtype=object)})
+                # 2. 直接调用 worker group (无需 .remote)
+                response_data = self.env_llm_worker.generate_responses(prompt_data)
+                # 3. 解包
+                llm_response = response_data.non_tensor_batch['responses'][0]
             else:
                 # === 本地 vLLM 模式 (原有逻辑) ===
                 if self.tokenizer:
