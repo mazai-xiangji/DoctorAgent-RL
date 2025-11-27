@@ -94,6 +94,8 @@ class ResourcePoolManager:
             use_gpu = True
             if resource_pool_name == 'env_pool':
                 use_gpu = False
+            # # 这样 Ray 就会忽略资源限制，强行启动所有 Worker。    
+            # use_gpu = False
             resource_pool = RayResourcePool(process_on_nodes=process_on_nodes,
                                             use_gpu=use_gpu,
                                             max_colocate_count=1,

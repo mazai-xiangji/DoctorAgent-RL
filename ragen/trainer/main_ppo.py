@@ -168,7 +168,9 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(num_cpus=200,runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray.init(num_cpus=100, 
+                # local_mode=True,  #debug的时候用
+                runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
 
     ray.get(main_task.remote(config))
 
@@ -231,8 +233,8 @@ def main_task(config):
     }
 
     if config.env.use_env_llm:
-        # use_api=config.env.get('use_api_for_env',False)
-        use_api = True
+        use_api=config.env.get('use_api_for_env',False)
+        # use_api = True
         if use_api:
             role_worker_mapping[Role.EnvLLM] = ray.remote(APIEnvironmentLLMWorker)
             resource_pool_spec[env_pool_id] = [1] * config.trainer.nnodes

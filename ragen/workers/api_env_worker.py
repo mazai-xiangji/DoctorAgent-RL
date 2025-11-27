@@ -1,7 +1,7 @@
 import ray
 from openai import OpenAI
 import logging
-from typing import List
+from typing import List,Union,Dict
 import concurrent.futures
 
 logger = logging.getLogger(__name__)
@@ -29,9 +29,13 @@ class APIEnvironmentLLMWorker:
 
     def _call_api(self, prompt: str) -> str:
         try:
+            if isinstance(prompt, list):
+                messages = prompt
+            else:
+                messages = [{"role": "user", "content": prompt}]
             response = self.client.chat.completions.create(
                 model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens
             )
@@ -40,7 +44,7 @@ class APIEnvironmentLLMWorker:
             logger.error(f"API Call Error: {e}")
             return "Sorry, I cannot answer right now."
 
-    def generate_responses(self, prompts: List[str]) -> List[str]:
+    def generate_responses(self, prompts: List[Union[str, List[Dict]]]) -> List[str]:
         """
         接收字符串列表，返回字符串列表。
         使用线程池并发请求，提高 RL 训练时的吞吐量。

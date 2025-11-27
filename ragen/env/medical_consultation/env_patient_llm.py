@@ -227,10 +227,12 @@ Doctor's Current Question: {question}
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ]
+        if getattr(self, 'use_api', False):
+            return messages        
 
-        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt_str  = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         
-        return prompt + "<think>"
+        return prompt_str  + "<think>"
 
     def _prepare_patient_prompt(self, doctor_question):
         """
@@ -257,10 +259,12 @@ Your self-report states: {self.description}
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ]
+        if getattr(self, 'use_api', False):
+            return messages
 
-        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt_str  = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         
-        return prompt
+        return prompt_str 
     
     def render(self, mode: str = 'rgb_array') -> str:
         """
