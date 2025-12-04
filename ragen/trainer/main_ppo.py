@@ -169,7 +169,7 @@ def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(
-                # local_mode=True,  #debug的时候用
+                local_mode=True,  #debug的时候用
                 runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
 
     ray.get(main_task.remote(config))
@@ -237,8 +237,8 @@ def main_task(config):
         # use_api = True
         if use_api:
             role_worker_mapping[Role.EnvLLM] = ray.remote(APIEnvironmentLLMWorker)
-            resource_pool_spec[env_pool_id] = [1] * config.trainer.nnodes
-            mapping[Role.EnvLLM] = env_pool_id
+            # resource_pool_spec[env_pool_id] = [1] * config.trainer.nnodes
+            mapping[Role.EnvLLM] = global_pool_id
 
         else:
             role_worker_mapping[Role.EnvLLM] = ray.remote(EnvironmentLLMWorker)

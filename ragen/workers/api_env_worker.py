@@ -53,22 +53,22 @@ class APIEnvironmentLLMWorker(Worker):
             logger.error(f"API Call Error: {e}")
             return "Sorry, I cannot answer right now."
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def generate_responses(self, data: DataProto) -> DataProto:
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def generate_responses(self, prompts: List[str]) -> List[str]:
         """
         Receives DataProto, extracts prompts from non_tensor_batch['prompts'],
         calls API concurrently, and returns DataProto with responses in non_tensor_batch['responses'].
         """
         # Extract prompts
         # Assuming prompts are passed in non_tensor_batch['prompts'] as a list or numpy array
-        prompts = data.non_tensor_batch.get('prompts')
-        if prompts is None:
-            # Fallback check if passed differently (though env should pack it)
-            logger.warning("No prompts found in non_tensor_batch['prompts']")
-            return DataProto.from_dict(non_tensor_batch={'responses': []})
+        # prompts = data.non_tensor_batch.get('prompts')
+        # if prompts is None:
+        #     # Fallback check if passed differently (though env should pack it)
+        #     logger.warning("No prompts found in non_tensor_batch['prompts']")
+        #     return DataProto.from_dict(non_tensor_batch={'responses': []})
 
-        if isinstance(prompts, np.ndarray):
-            prompts = prompts.tolist()
+        # if isinstance(prompts, np.ndarray):
+        #     prompts = prompts.tolist()
 
         results = [None] * len(prompts)
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
@@ -83,4 +83,4 @@ class APIEnvironmentLLMWorker(Worker):
                     results[idx] = "Error"
         
         # Return as DataProto
-        return DataProto.from_dict(non_tensor_batch={'responses': np.array(results, dtype=object)})
+        return results

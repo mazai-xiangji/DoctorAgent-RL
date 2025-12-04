@@ -287,7 +287,10 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
         valid_question_actions = []
         valid_question_indices = []
         if llm_inputs:
-            batch_responses = cls._batch_llm_inference(envs[0].env_llm_worker, tokenizer, llm_inputs)
+            if getattr(envs[0], 'use_api', False):
+                batch_responses = envs[0].env_llm_worker.generate_responses(llm_inputs)[0]
+            else:
+                batch_responses = cls._batch_llm_inference(envs[0].env_llm_worker, tokenizer, llm_inputs)
             for i, (env_idx, response_text) in enumerate(zip(llm_env_indices, batch_responses)):
                 env = envs[env_idx]
                 action = cur_actions[env_idx]
@@ -307,7 +310,10 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
         patient_responses_map = {}
         if valid_question_envs:
             patient_prompts = [env._prepare_patient_prompt(action) for env, action in zip(valid_question_envs, valid_question_actions)]
-            patient_responses = cls._batch_llm_inference(valid_question_envs[0].env_llm_worker, tokenizer, patient_prompts)
+            if getattr(valid_question_envs[0], 'use_api', False):
+                patient_responses = valid_question_envs[0].env_llm_worker.generate_responses(patient_prompts)[0]
+            else:
+                patient_responses = cls._batch_llm_inference(valid_question_envs[0].env_llm_worker, tokenizer, patient_prompts)
             for i, (env_idx, patient_response_text) in enumerate(zip(valid_question_indices, patient_responses)):
                 env = valid_question_envs[i]
                 action = valid_question_actions[i]
@@ -344,7 +350,10 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
                     local_diagnosis_env_indices.append(env_index)
 
             if diagnosis_prompts:
-                all_scores = cls._batch_llm_inference(envs[0].env_llm_worker, tokenizer, diagnosis_prompts)
+                if getattr(envs[0], 'use_api', False):
+                    all_scores = envs[0].env_llm_worker.generate_responses(diagnosis_prompts)[0]
+                else:
+                    all_scores = cls._batch_llm_inference(envs[0].env_llm_worker, tokenizer, diagnosis_prompts)
                 score_index = 0
                 for i, env_idx in enumerate(local_diagnosis_env_indices):
                     env = envs[env_idx]
