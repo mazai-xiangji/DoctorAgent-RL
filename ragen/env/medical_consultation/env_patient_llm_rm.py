@@ -1,19 +1,13 @@
 from typing import Optional, List, Tuple, Any, Dict
-from ragen.env.base import BaseLanguageBasedEnv
 import random
 import gymnasium as gym
-import pandas as pd
 import re
-from rouge_score import rouge_scorer
-import json
 import torch
+from transformers import AutoTokenizer
+import numpy as np
 from verl import DataProto
 from verl.utils.model import compute_position_id_with_mask
-from transformers import AutoTokenizer
-from ragen.workers.env_llm_worker import EnvironmentLLMWorker
-from omegaconf import OmegaConf
-import ray
-import numpy as np
+
 from ragen.env.medical_consultation.env_patient_llm import MedicalConsultationEnvWithPatientLLM
 
 class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatientLLM):
@@ -24,20 +18,64 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
     """
 
     PENALTY_FOR_INVALID = 0
-    INVALID_FORMAT_MESSAGE = "Your format is invalid. Please strictly follow the format: <think>[Thinking]</think><answer>[Question]</answer>. Do not output any other content after </answer>."
-    MAX_TURNS_REACHED_MESSAGE = "Maximum turns reached. Please make a diagnosis."
-    ONE_QUESTION_AT_A_TIME_MESSAGE = "You can only ask one question at a time."
-    DUPLICATE_QUESTION_MESSAGE = "You've asked this question before. Please ask a new question."
-    UNKNOWN_RESPONSE_MESSAGE = "Sorry, I do not know."
-    DIAGNOSIS_REWARD_SCALE = 5
-    RECOMMENDATION_REWARD_SCALE = 5
-    INVALID_ACTION_PENALTY = -2.0
-    MAX_TURNS_PENALTY = -5.0
-    DUPLICATE_QUESTION_PENALTY = -2.0
-    UNKNOWN_RESPONSE_PENALTY = -1.0
-    VALID_RESPONSE_REWARD = 1.0
+    # ====== TCM 专用：System Prompt 占位符（你后续自行替换） ======
+    DOCTOR_SYSTEM_PROMPT = """作为一名经验丰富的老中医，你的任务是对病人进行中医问诊，并最终给出诊断。
 
-    def __init__(self, parquet_path: str, env_llm_worker=None, tokenizer=None, max_turns=5,use_api=False):
+【核心任务】
+1. **问诊**: 主动、多次提问以获取充足信息。每次只问一个核心问题，避免信息混乱。
+2. **诊断**: 在信息充分后，及时给出明确的诊断结果（包括病名和中医证型）、诊断依据及治疗方案。
+3. **效率**: 请力求在 **10轮对话** 内完成。优先询问关键问题（如主诉、二便、饮食、睡眠等），避免闲聊。
+
+【输出规则（必须严格遵守）】
+你必须先进行思考，输出 `<think>...</think>`，然后根据思考结果，选择以下**三种格式之一**作为你回复的内容：
+
+1. **询问患者** (用于询问主观感受、过往病史、生活习惯)：
+   格式示例：<对患者>您最近睡眠怎么样？
+
+2. **询问助理** (用于查询客观信息，如舌象、脉象、检查报告)：
+   格式示例：<对助理>请提供患者的舌象和脉象。
+
+3. **提交诊断** (用于向专家汇报最终结果，包含诊断、依据和治疗方案)：
+   格式示例：<对专家>诊断结果：肝郁脾虚证。诊断依据：... 治疗方案：...</对专家>
+请严格遵循此流程：先输出 <think> [你的思考] </think>，然后直接输出你的问诊或诊断内容。不要输出任何额外的标签、解释或说明。"""
+
+    # ====== 输出格式与动作前缀 ======
+    ACTION_PREFIX_PATIENT = "<对患者>"
+    ACTION_PREFIX_ASSISTANT = "<对助理>"
+    ACTION_PREFIX_EXPERT = "<对专家>"
+    ALLOWED_PREFIXES = (ACTION_PREFIX_PATIENT, ACTION_PREFIX_ASSISTANT, ACTION_PREFIX_EXPERT)
+
+    INVALID_FORMAT_MESSAGE = (
+        "格式无效。请严格输出：<think>...</think><answer><对患者>...</answer> 或 <answer><对助理>...</answer> 或 <answer><对专家>...</answer>。"
+        "</answer> 后不要输出任何额外内容。"
+    )
+    MAX_TURNS_REACHED_MESSAGE = "已达最大轮次，请输出 <对专家>... 给出最终中医诊断。"
+
+    # ====== Reward Engineering（可按需调参） ======
+    STEP_PENALTY = -0.05
+    FORMAT_PENALTY = -1.0
+    ROUTING_PENALTY = -1.0
+    EFFECTIVENESS_INVALID_PENALTY = -0.5
+    EFFECTIVENESS_VALID_REWARD = 0.1
+
+    OUTCOME_SCORE_MIN = 0.0
+    OUTCOME_SCORE_MAX = 5.0
+
+    # 路由规则关键词：这些通常应问“专家/查体”而非问患者
+    ROUTING_KEYWORDS_PATTERN = re.compile(r"(舌|脉|苔|查体)")
+    # 无效/敷衍回复判定关键词
+    INVALID_PATIENT_REPLY_PATTERN = re.compile(r"(不知道|不清楚|抱歉|Sorry|I\s*don'?t\s*know)", re.IGNORECASE)
+
+    def __init__(
+        self,
+        parquet_path: str,
+        env_llm_worker=None,
+        tokenizer=None,
+        max_turns=5,
+        use_api=False,
+        assistant_llm_worker=None,
+        rm_llm_worker=None,
+    ):
         """
         Initialize the environment for Medical Consultation
 
@@ -51,10 +89,14 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
             self.random_turn = True
         else:
             self.random_turn = False
-        super().__init__(parquet_path, env_llm_worker, tokenizer, max_turns,use_api=use_api)
+        super().__init__(parquet_path, env_llm_worker, tokenizer, max_turns, use_api=use_api)
         self.description = None
+        self.assistant_description = None
         self.diagnosis_score = None
         self.recommandation_score = None
+        # 默认：若不单独提供，则助理/专家打分均复用 env_llm_worker
+        self.assistant_llm_worker = assistant_llm_worker
+        self.rm_llm_worker = rm_llm_worker
 
     def copy(self) -> 'MedicalConsultationEnvWithPatientLLMandRM':
         """
@@ -66,7 +108,9 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
             env_llm_worker=self.env_llm_worker,
             tokenizer=self.tokenizer,
             max_turns=self.max_turns,
-            use_api=getattr(self, 'use_api', False)
+            use_api=getattr(self, 'use_api', False),
+            assistant_llm_worker=self.assistant_llm_worker,
+            rm_llm_worker=self.rm_llm_worker,
         )
         
         # 只复制实例特定的数据
@@ -75,6 +119,7 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
         new_env.index = self.index
         new_env.current_turn = self.current_turn
         new_env.description = self.description
+        new_env.assistant_description = self.assistant_description
 
         self._copy_tracking_variables(new_env)
         return new_env
@@ -91,6 +136,9 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
         self._reset_tracking_variables()
         self.index = self._shared_seed_to_index[seed]
         self.description = self._shared_data[self.index]['description']
+        self.assistant_description = self._shared_data[self.index].get('assistant_description', "")
+        # 默认将患者描述复用给“助理侧上下文”，你可按需改为更结构化的信息
+        self.assistant_description = self.assistant_description
         self.diagnosis_made = False
         self.current_turn = 0
         self.conversation_history = []
@@ -117,30 +165,188 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
             
         # 构建输出
         output = ""
-        
-        # 只显示患者当前这一轮的回复
-        if self.conversation_history and len(self.conversation_history) >= 2:
-            # 获取最后一轮对话（医生的问题和患者的回复）
-            last_doctor_turn = self.conversation_history[-2]
-            last_patient_turn = self.conversation_history[-1]
-            
-            # 只显示患者的回复
-            output += f"{last_patient_turn['content']}\n"
+
+        # 提供 Doctor System Prompt（占位符），便于你后续替换为中医问诊专用 prompt
+        if self.current_turn == 0 and not self.conversation_history:
+            output += f"[System Prompt]\n{self.build_doctor_system_prompt()}\n\n"
+
+        # 显示最后一条“非 doctor”的回复（可能来自患者或助理）
+        last_non_doctor = None
+        for turn in reversed(self.conversation_history):
+            if turn.get('role') != 'doctor':
+                last_non_doctor = turn
+                break
+        if last_non_doctor is not None:
+            output += f"{last_non_doctor['content']}\n"
         else:
-            output += "No patient response yet.\n"
+            output += "No reply yet.\n"
         
         # 添加诊断状态
         if self.diagnosis_made:
-            output = "\nDiagnosis has been made. Consultation is complete."
+            output += "\n已完成诊断，本轮问诊结束。"
         else:
-            output += f"\nTurn {self.current_turn}/{self.max_turns}. You have to give a diagnosis and a recommendation before the end of the conversation.\n"
+            output += "\n请通过 <对患者> 问诊，或 <对助理> 获取舌脉/检查信息，最终用 <对专家> 给出诊断。\n"
 
         return output
+
+    def build_doctor_system_prompt(self) -> str:
+        """Doctor Agent 的系统指令（占位符）。"""
+        return self.DOCTOR_SYSTEM_PROMPT
+
+    def step(self, action: str) -> Tuple[str, float, bool, Dict]:
+        """单环境 step：支持 <对患者>/<对助理>/<对专家> 三分支逻辑。"""
+        if self.diagnosis_made:
+            return self.render(), 0.0, True, {"action_is_effective": False}
+
+        self.current_turn += 1
+        reward = self.STEP_PENALTY
+
+        prefix, payload = self._extract_prefix_and_payload(action)
+        if prefix is None:
+            reward += self.FORMAT_PENALTY
+            # 这里的 step 假设 action 已是 <answer> 内文本，因此直接把错误信息当作“对方回复”
+            self._update_conversation_history(self, action, self.INVALID_FORMAT_MESSAGE, other_role="system")
+            return self.render(), reward, False, {"action_is_effective": False}
+
+        # 达到最大轮次：若不是 <对专家>，强制结束
+        if self.current_turn >= self.max_turns and prefix != self.ACTION_PREFIX_EXPERT:
+            self.diagnosis_made = True
+            self._update_conversation_history(self, action, self.MAX_TURNS_REACHED_MESSAGE, other_role="system")
+            return self.render(), reward, True, {"action_is_effective": False}
+
+        if prefix == self.ACTION_PREFIX_PATIENT:
+            if self.ROUTING_KEYWORDS_PATTERN.search(payload):
+                reward += self.ROUTING_PENALTY
+
+            prompt = self._prepare_patient_prompt_tcm(payload)
+            reply = self._batch_llm_inference(self.env_llm_worker, self.tokenizer, [prompt])[0]
+            if "\nassistant\n" in reply:
+                reply = reply.split("\nassistant\n", 1)[1].strip()
+
+            if self.INVALID_PATIENT_REPLY_PATTERN.search(reply or ""):
+                reward += self.EFFECTIVENESS_INVALID_PENALTY
+            else:
+                reward += self.EFFECTIVENESS_VALID_REWARD
+
+            self._update_conversation_history(self, payload, reply, other_role="patient")
+            return self.render(), reward, False, {"action_is_effective": True}
+
+        if prefix == self.ACTION_PREFIX_ASSISTANT:
+            worker = self.assistant_llm_worker or self.env_llm_worker
+            prompt = self._prepare_assistant_prompt_tcm(payload)
+            reply = self._batch_llm_inference(worker, self.tokenizer, [prompt])[0]
+            if "\nassistant\n" in reply:
+                reply = reply.split("\nassistant\n", 1)[1].strip()
+            self._update_conversation_history(self, payload, reply, other_role="assistant")
+            return self.render(), reward, False, {"action_is_effective": True}
+
+        if prefix == self.ACTION_PREFIX_EXPERT:
+            gt_diagnosis = self._shared_data[self.index]['target']['diagnosis']
+            worker = self.rm_llm_worker or self.env_llm_worker
+            prompt = self._prepare_tcm_outcome_scoring_prompt(payload, gt_diagnosis)
+            score_text = self._batch_llm_inference(worker, self.tokenizer, [prompt])[0]
+
+            score = 0.0
+            try:
+                m = re.search(r"<answer>(.*?)</answer>", score_text, re.DOTALL)
+                score_str = m.group(1).strip() if m else score_text.strip()
+                digits = re.findall(r"[0-5]", score_str)
+                score = float(digits[0]) if digits else 0.0
+            except Exception:
+                score = 0.0
+            score = max(self.OUTCOME_SCORE_MIN, min(self.OUTCOME_SCORE_MAX, score))
+
+            reward += score
+            self.diagnosis_score = score
+            self.diagnosis_made = True
+            self._update_conversation_history(self, payload, f"[Expert Score] {score}", other_role="expert")
+            return self.render(), reward, True, {"action_is_effective": True, "diagnosis_score": score}
+
+        reward += self.FORMAT_PENALTY
+        self._update_conversation_history(self, action, self.INVALID_FORMAT_MESSAGE, other_role="system")
+        return self.render(), reward, False, {"action_is_effective": False}
+
+    # ====== TCM：Prompt 构造 ======
+    def _prepare_patient_prompt_tcm(self, doctor_to_patient: str):
+        system_prompt = (
+            "你是中医门诊的患者。请只从患者视角回答医生的问题，描述症状与感受，"
+            "不要给出诊断/病名/证型/治疗方案。若无法回答，请直接说明不知道。\n\n"
+            f"患者自述信息：{self.description}"
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": doctor_to_patient},
+        ]
+        if getattr(self, 'use_api', False) or self.tokenizer is None:
+            return messages
+        return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    def _prepare_assistant_prompt_tcm(self, doctor_to_assistant: str):
+        system_prompt = (
+            "你是中医辅助检查助手。你的职责是提供客观的查体信息和辅助检查结果。\n"
+            "当医生询问舌象、脉象（舌诊/脉诊）或实验室检查结果时，请根据患者的病历信息如实客观描述。\n"
+            "请注意：\n"
+            "1. 只陈述检查结果（如：'舌红苔黄腻，脉滑数' 或 '血常规显示白细胞升高'）。\n"
+            "2. 不要进行其他无关的输出。\n\n"
+            f"患者客观病历信息：{self.assistant_description}"
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": doctor_to_assistant},
+        ]
+        if getattr(self, 'use_api', False) or self.tokenizer is None:
+            return messages
+        return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    def _prepare_tcm_outcome_scoring_prompt(self, candidate: str, reference: str):
+        # 这里的模板你可后续继续精修；当前实现满足“0-5分”的一致性评分需求
+        system_prompt = (
+            "你是一位资深中医专家评审。请比较候选诊断与参考诊断在“中医病名”和“证型”上的一致性，"
+            "给出 0-5 的整数分（5=高度一致，0=完全不一致）。只输出分数。\n"
+            "输出格式必须为：<answer>n</answer>，其中 n 为 0-5。"
+        )
+        user_prompt = (
+            f"候选诊断：{candidate}\n\n"
+            f"参考诊断：{reference}\n"
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if getattr(self, 'use_api', False) or self.tokenizer is None:
+            return messages
+        return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    # ====== TCM：动作解析 ======
+    @classmethod
+    def _extract_prefix_and_payload(cls, answer_text: str) -> Tuple[Optional[str], str]:
+        if answer_text is None:
+            return None, ""
+        stripped = answer_text.strip()
+        for prefix in cls.ALLOWED_PREFIXES:
+            if stripped.startswith(prefix):
+                return prefix, stripped[len(prefix):].strip()
+        return None, stripped
+
+    @classmethod
+    def _format_is_valid(cls, response: str, answer_text: Optional[str]) -> bool:
+        if answer_text is None:
+            return False
+        if "<think>" not in response:
+            return False
+        if not answer_text.strip().startswith(cls.ALLOWED_PREFIXES):
+            return False
+        # 要求 </answer> 仅出现一次，且其后无额外内容（除 <|im_end|>）
+        if response.count("</answer>") != 1:
+            return False
+        tail_match = re.search(r"</answer>(.*?)(<\|im_end\|>|$)", response, re.DOTALL)
+        if tail_match and tail_match.group(1).strip():
+            return False
+        return True
     
     def _process_invalid_action(self, env: 'MedicalConsultationEnvWithPatientLLMandRM', response: str, action: str, reward: float):
         """Handles invalid doctor actions."""
         obs = self.INVALID_FORMAT_MESSAGE
-        reward += self.INVALID_ACTION_PENALTY
         done = False
         self._update_conversation_history(env, response, obs)
         self._update_tracking_variables_env(env, response, action, False, False, reward)
@@ -149,44 +355,34 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
     def _process_max_turns(self, env: 'MedicalConsultationEnvWithPatientLLMandRM', response: str, action: str):
         """Handles the case when the maximum number of turns is reached."""
         obs = self.MAX_TURNS_REACHED_MESSAGE
-        reward = self.MAX_TURNS_PENALTY
+        reward = self.STEP_PENALTY
         done = True
         env.diagnosis_made = True
         self._update_conversation_history(env, response, obs)
         self._update_tracking_variables_env(env, response, action, True, False, reward)
         return self.formulate_output(env.render(), done, response), done
 
-    def _process_invalid_question_count(self, env: 'MedicalConsultationEnvWithPatientLLMandRM', response: str, action: str):
-        """Handles cases where the doctor asks more than one question."""
-        obs = self.ONE_QUESTION_AT_A_TIME_MESSAGE
-        reward = self.INVALID_ACTION_PENALTY
-        done = False
-        self._update_conversation_history(env, response, obs)
-        self._update_tracking_variables_env(env, response, action, False, False, reward)
-        return self.formulate_output(env.render(), done, response), done
+    # 兼容旧接口（不再使用“一问一答/重复问题”逻辑）
 
-    def _process_duplicate_question(self, env: 'MedicalConsultationEnvWithPatientLLMandRM', response: str, action: str, patient_response: str):
-        """Handles duplicate questions asked by the doctor."""
-        obs = self.DUPLICATE_QUESTION_MESSAGE
-        reward = self.DUPLICATE_QUESTION_PENALTY
-        done = False
-        self._update_conversation_history(env, response, obs)
-        self._update_tracking_variables_env(env, response, action, False, False, reward)
-        return self.formulate_output(env.render(), done, response), done
+    # 兼容旧接口（不再使用“重复问题”逻辑）
 
     def _process_patient_response(self, env: 'MedicalConsultationEnvWithPatientLLMandRM', response: str, action: str, patient_response: str):
         """Processes a valid patient response."""
-        reward = self.VALID_RESPONSE_REWARD if "Sorry" not in patient_response else self.UNKNOWN_RESPONSE_PENALTY
-        patient_response = patient_response if "Sorry" not in patient_response else self.UNKNOWN_RESPONSE_MESSAGE
+        reward = self.STEP_PENALTY
+        if self.INVALID_PATIENT_REPLY_PATTERN.search(patient_response or ""):
+            reward += self.EFFECTIVENESS_INVALID_PENALTY
+        else:
+            reward += self.EFFECTIVENESS_VALID_REWARD
+
         self._update_conversation_history(env, action, patient_response)
         done = env.finished()
-        self._update_tracking_variables_env(env, response, action, True, reward > 0, reward)
+        self._update_tracking_variables_env(env, response, action, True, True, reward)
         return self.formulate_output(env.render(), done, response), done
 
-    def _update_conversation_history(self, env: 'MedicalConsultationEnvWithPatientLLMandRM', doctor_content: str, patient_content: str):
+    def _update_conversation_history(self, env: 'MedicalConsultationEnvWithPatientLLMandRM', doctor_content: str, other_content: str, other_role: str = "patient"):
         """Updates the conversation history."""
         env.conversation_history.append({"role": "doctor", "content": doctor_content})
-        env.conversation_history.append({"role": "patient", "content": patient_content})
+        env.conversation_history.append({"role": other_role, "content": other_content})
 
     def _update_tracking_variables_env(self, env: 'MedicalConsultationEnvWithPatientLLMandRM', response: str, action: str, action_is_valid: bool, action_is_effective: bool, reward: float):
         """Updates the tracking variables in the environment."""
@@ -198,33 +394,9 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
             reward=reward
         )
 
-    def _prepare_diagnosis_scoring_prompt(self, diagnosis: str, gt_diagnosis: str):
-        """
-        Prepares the prompt for scoring the diagnosis.
-        Args:
-            diagnosis: The proposed diagnosis
-            gt_diagnosis: The ground truth diagnosis
-        Returns:
-            The prepared prompt
-        """
-        with open('ragen/env/medical_consultation/evaluation/eval_prompt_template_v2.txt', 'r') as file:
-            prompt = file.read()
-            prompt = prompt.format(candidate=diagnosis, reference=gt_diagnosis)
-        return prompt
+    # 旧的 eval_prompt_template_v2 方式已不适配本次“中医病名/证型一致性”需求，改为 _prepare_tcm_outcome_scoring_prompt
 
-    def _prepare_recommendation_scoring_prompt(self, recommendation: str, gt_recommendation: str):
-        """
-        prepares the prompt for scoring the recommendation.
-        Args:
-            recommendation: The proposed recommendation
-            gt_recommendation: The ground truth recommendation
-        Returns:
-            The prepared prompt
-        """
-        with open('ragen/env/medical_consultation/evaluation/eval_prompt_template_v2.txt', 'r') as file:
-            prompt = file.read()
-            prompt = prompt.format(candidate=recommendation, reference=gt_recommendation)
-        return prompt
+    # recommendation 相关评分在中医任务中暂不使用（如需可自行扩展）
 
     @classmethod
     def execute_predictions(cls, envs: List['MedicalConsultationEnvWithPatientLLMandRM'], predictions: List[str], prediction_ids: torch.Tensor, tokenizer: AutoTokenizer):
@@ -241,178 +413,168 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
             List of observation strings and done flags
         """
         cur_actions, action_is_valid = cls.postprocess_predictions(envs, predictions)
+
         num_envs = len(envs)
         next_obs = [""] * num_envs
         dones = [False] * num_envs
-        llm_inputs = []
-        llm_env_indices = []
-        diagnosis_actions = []
-        diagnosis_env_indices = []
 
-        # First pass: Process non-diagnosis actions and collect diagnosis actions
-        for i, (env, action, response, av) in enumerate(zip(envs, cur_actions, predictions, action_is_valid)):
-            env.current_turn += 1
-            reward = 0
+        # 批处理队列
+        patient_prompts: List[Any] = []
+        patient_indices: List[int] = []
+        patient_actions: List[str] = []
+        patient_payloads: List[str] = []
 
+        assistant_prompts: List[Any] = []
+        assistant_indices: List[int] = []
+        assistant_actions: List[str] = []
+        assistant_payloads: List[str] = []
+
+        expert_prompts: List[Any] = []
+        expert_indices: List[int] = []
+        expert_actions: List[str] = []
+        expert_payloads: List[str] = []
+
+        # 第一遍：解析动作、做格式检查、分流到不同队列
+        for i, (env, answer_text, response, av) in enumerate(zip(envs, cur_actions, predictions, action_is_valid)):
             if env.finished():
                 next_obs[i] = cls.formulate_output(env.render() + tokenizer.pad_token, True, response)
                 dones[i] = True
                 continue
 
-            count_answer = response.count("</answer>")
-            match = re.search(r"</answer>(.*?)(<\|im_end\|>|$)", response, re.DOTALL)
-            if not av or count_answer != 1 or (match and len(match.group(1)) != 0):
-                next_obs[i], dones[i] = env._process_invalid_action(env, response, action, reward)
+            env.current_turn += 1
+            reward = cls.STEP_PENALTY
+
+            prefix, payload = cls._extract_prefix_and_payload(answer_text)
+            # 统一格式奖励/惩罚：必须有 <think> 且 <answer> 以三前缀之一开头
+            if not cls._format_is_valid(response, answer_text):
+                reward += cls.FORMAT_PENALTY
+                next_obs[i], dones[i] = env._process_invalid_action(env, response, answer_text or "", reward)
                 continue
 
-            if "Diagnosis" in action:
-                diagnosis_actions.append(action)
-                diagnosis_env_indices.append(i)
+            # 达到最大轮次：若不是 <对专家>，强制结束
+            if env.current_turn >= env.max_turns and prefix != cls.ACTION_PREFIX_EXPERT:
+                next_obs[i], dones[i] = env._process_max_turns(env, response, answer_text or "")
                 continue
 
-            if env.current_turn >= env.max_turns:
-                next_obs[i], dones[i] = env._process_max_turns(env, response, action)
+            if prefix == cls.ACTION_PREFIX_PATIENT:
+                # 路由规则：不应对患者问“舌/脉/苔/查体”这类
+                if cls.ROUTING_KEYWORDS_PATTERN.search(payload):
+                    reward += cls.ROUTING_PENALTY
+
+                prompt = env._prepare_patient_prompt_tcm(payload)
+                patient_prompts.append(prompt)
+                patient_indices.append(i)
+                patient_actions.append(answer_text)
+                patient_payloads.append(payload)
+                # tracking 等在拿到 patient 回复后统一更新
                 continue
 
-            count_question = action.count("?") + action.count("？")
-            if count_question != 1:
-                next_obs[i], dones[i] = env._process_invalid_question_count(env, response, action)
+            if prefix == cls.ACTION_PREFIX_ASSISTANT:
+                prompt = env._prepare_assistant_prompt_tcm(payload)
+                assistant_prompts.append(prompt)
+                assistant_indices.append(i)
+                assistant_actions.append(answer_text)
+                assistant_payloads.append(payload)
                 continue
 
-            llm_inputs.append(env._prepare_judge_prompt(action))
-            llm_env_indices.append(i)
+            if prefix == cls.ACTION_PREFIX_EXPERT:
+                # episode 结束：对专家内容作为候选诊断
+                gt_diagnosis = cls._shared_data[env.index]['target']['diagnosis']
+                prompt = env._prepare_tcm_outcome_scoring_prompt(payload, gt_diagnosis)
+                expert_prompts.append(prompt)
+                expert_indices.append(i)
+                expert_actions.append(answer_text)
+                expert_payloads.append(payload)
+                continue
 
-        # Batch process question validity
-        valid_question_envs = []
-        valid_question_actions = []
-        valid_question_indices = []
-        if llm_inputs:
-            if getattr(envs[0], 'use_api', False):
-                batch_responses = envs[0].env_llm_worker.generate_responses(llm_inputs)[0]
-            else:
-                batch_responses = cls._batch_llm_inference(envs[0].env_llm_worker, tokenizer, llm_inputs)
-            for i, (env_idx, response_text) in enumerate(zip(llm_env_indices, batch_responses)):
+            # 理论上不会到这里（前面已做 prefix 校验）
+            reward += cls.FORMAT_PENALTY
+            next_obs[i], dones[i] = env._process_invalid_action(env, response, answer_text or "", reward)
+
+        # 第二遍：批量执行 Patient LLM
+        if patient_prompts:
+            worker = getattr(envs[0], 'env_llm_worker', None)
+            patient_texts = cls._batch_llm_inference(worker, tokenizer, patient_prompts)
+            for env_idx, reply_text, raw_action, payload in zip(patient_indices, patient_texts, patient_actions, patient_payloads):
                 env = envs[env_idx]
-                action = cur_actions[env_idx]
-                response = predictions[env_idx]
-                if "Sorry" in response_text:
-                    next_obs[env_idx], dones[env_idx] = env._process_duplicate_question(env, response, action, response_text)
-                else:
-                    valid_question_envs.append(env)
-                    valid_question_actions.append(action)
-                    valid_question_indices.append(env_idx)
-        else:
-            valid_question_envs = []
-            valid_question_actions = []
-            valid_question_indices = []
-
-        # Batch process patient responses for valid questions
-        patient_responses_map = {}
-        if valid_question_envs:
-            patient_prompts = [env._prepare_patient_prompt(action) for env, action in zip(valid_question_envs, valid_question_actions)]
-            if getattr(valid_question_envs[0], 'use_api', False):
-                patient_responses = valid_question_envs[0].env_llm_worker.generate_responses(patient_prompts)[0]
-            else:
-                patient_responses = cls._batch_llm_inference(valid_question_envs[0].env_llm_worker, tokenizer, patient_prompts)
-            for i, (env_idx, patient_response_text) in enumerate(zip(valid_question_indices, patient_responses)):
-                env = valid_question_envs[i]
-                action = valid_question_actions[i]
                 response = predictions[env_idx]
 
-                if "\nassistant\n" in patient_response_text:
-                    patient_response_text = patient_response_text.split("\nassistant\n")[1].strip()
+                if "\nassistant\n" in reply_text:
+                    reply_text = reply_text.split("\nassistant\n", 1)[1].strip()
 
-                next_obs[env_idx], dones[env_idx] = env._process_patient_response(env, response, action, patient_response_text)
-                patient_responses_map[env_idx] = patient_response_text  # Store patient responses for potential later use
-
-        # Batch process diagnosis actions
-        if diagnosis_actions:
-            diagnosis_prompts = []
-            gt_diagnoses = []
-            gt_recommendations = []
-            local_diagnosis_env_indices = []
-
-            for i, action in enumerate(diagnosis_actions):
-                diagnosis_match = re.search(r"Diagnosis[:：](.*?)(?=Recommendation[:：]|$)", action, re.DOTALL)
-                recommendation_match = re.search(r"Recommendation[:：](.*?)(?=\n|$)", action, re.DOTALL)
-
-                if diagnosis_match:
-                    diagnosis = diagnosis_match.group(1).strip()
-                    recommendation = recommendation_match.group(1).strip() if recommendation_match else ""
-                    env_index = diagnosis_env_indices[i]
-                    gt_diagnosis = cls._shared_data[envs[env_index].index]['target']['diagnosis']
-                    gt_recommendation = cls._shared_data[envs[env_index].index]['target']['recommendation']
-
-                    diagnosis_prompts.append(envs[env_index]._prepare_diagnosis_scoring_prompt(diagnosis, gt_diagnosis))
-                    diagnosis_prompts.append(envs[env_index]._prepare_recommendation_scoring_prompt(recommendation, gt_recommendation))
-                    gt_diagnoses.append(gt_diagnosis)
-                    gt_recommendations.append(gt_recommendation)
-                    local_diagnosis_env_indices.append(env_index)
-
-            if diagnosis_prompts:
-                if getattr(envs[0], 'use_api', False):
-                    all_scores = envs[0].env_llm_worker.generate_responses(diagnosis_prompts)[0]
+                reward = cls.STEP_PENALTY
+                if cls.ROUTING_KEYWORDS_PATTERN.search(payload):
+                    reward += cls.ROUTING_PENALTY
+                if cls.INVALID_PATIENT_REPLY_PATTERN.search(reply_text or ""):
+                    reward += cls.EFFECTIVENESS_INVALID_PENALTY
                 else:
-                    all_scores = cls._batch_llm_inference(envs[0].env_llm_worker, tokenizer, diagnosis_prompts)
-                score_index = 0
-                for i, env_idx in enumerate(local_diagnosis_env_indices):
-                    env = envs[env_idx]
-                    action = diagnosis_actions[i]
-                    response = predictions[env_idx]
-                    reward = 0
-                    env.diagnosis_score = 0
-                    env.recommandation_score = 0
+                    reward += cls.EFFECTIVENESS_VALID_REWARD
 
-                    try:
-                        # extract score from <answer></answer>
-                        score = all_scores[score_index]
-                        score_match = re.search(r"<answer>(.*?)</answer>", score, re.DOTALL)
-                        if score_match:
-                            score = score_match.group(1).strip()
-                        score_pattern = r'[0-5]'
-                        extracted_numbers = re.findall(score_pattern, score, re.DOTALL)
-                        if extracted_numbers:
-                            score = extracted_numbers[0]
-                        else:
-                            score = '0'
-                            print(f"Warning: Invalid diagnosis format in LLM output: '{all_scores[score_index]}'. Setting to 0.")
-                        diagnosis_score = float(score) if score else 0
-                        reward += diagnosis_score
-                        env.diagnosis_score = diagnosis_score
-                    except (ValueError, IndexError):
-                        print(f"Warning: Could not parse diagnosis score from LLM output: {all_scores[score_index] if score_index < len(all_scores) else 'None'}")
-                    score_index += 1
+                env._update_conversation_history(env, payload, reply_text, other_role="patient")
+                done = env.finished()
+                env._update_tracking_variables_env(env, response, raw_action, True, True, reward)
+                next_obs[env_idx] = cls.formulate_output(env.render(), done, response)
+                dones[env_idx] = done
 
-                    try:
-                        score = all_scores[score_index]
-                        score_match = re.search(r"<answer>(.*?)</answer>", score, re.DOTALL)
-                        if score_match:
-                            score = score_match.group(1).strip()
-                        score_pattern = r'[0-5]'
-                        extracted_numbers = re.findall(score_pattern, score, re.DOTALL)
-                        if extracted_numbers:
-                            score = extracted_numbers[0]
-                        else:
-                            score = '0'
-                            print(f"Warning: Invalid diagnosis format in LLM output: '{all_scores[score_index]}'. Setting to 0.")
-                        recommendation_score = float(score) if score else 0
-                        reward += recommendation_score
-                        env.recommandation_score = recommendation_score
-                    except (ValueError, IndexError):
-                        print(f"Warning: Could not parse recommendation score from LLM output: {all_scores[score_index] if score_index < len(all_scores) else 'None'}")
-                    score_index += 1
+        # 第三遍：批量执行 Assistant LLM
+        if assistant_prompts:
+            # 若未单独提供助理 worker，则复用 env_llm_worker
+            assistant_worker = getattr(envs[0], 'assistant_llm_worker', None) or getattr(envs[0], 'env_llm_worker', None)
+            assistant_texts = cls._batch_llm_inference(assistant_worker, tokenizer, assistant_prompts)
+            for env_idx, reply_text, raw_action, payload in zip(assistant_indices, assistant_texts, assistant_actions, assistant_payloads):
+                env = envs[env_idx]
+                response = predictions[env_idx]
 
-                    env.diagnosis_made = True
-                    env._update_tracking_variables_env(env, response, action, True, True, reward)
-                    next_obs[env_idx] = cls.formulate_output(env.render(), True, response)
-                    dones[env_idx] = True
+                if "\nassistant\n" in reply_text:
+                    reply_text = reply_text.split("\nassistant\n", 1)[1].strip()
+
+                reward = cls.STEP_PENALTY
+                env._update_conversation_history(env, payload, reply_text, other_role="assistant")
+                done = env.finished()
+                env._update_tracking_variables_env(env, response, raw_action, True, True, reward)
+                next_obs[env_idx] = cls.formulate_output(env.render(), done, response)
+                dones[env_idx] = done
+
+        # 第四遍：批量执行 Outcome Reward（仅 <对专家>）
+        if expert_prompts:
+            rm_worker = getattr(envs[0], 'rm_llm_worker', None) or getattr(envs[0], 'env_llm_worker', None)
+            score_texts = cls._batch_llm_inference(rm_worker, tokenizer, expert_prompts)
+            for env_idx, score_text, raw_action, candidate_diag in zip(expert_indices, score_texts, expert_actions, expert_payloads):
+                env = envs[env_idx]
+                response = predictions[env_idx]
+                reward = cls.STEP_PENALTY
+
+                # 解析 0-5 分
+                score = 0.0
+                try:
+                    m = re.search(r"<answer>(.*?)</answer>", score_text, re.DOTALL)
+                    score_str = m.group(1).strip() if m else score_text.strip()
+                    digits = re.findall(r"[0-5]", score_str)
+                    score = float(digits[0]) if digits else 0.0
+                except Exception:
+                    score = 0.0
+
+                score = max(cls.OUTCOME_SCORE_MIN, min(cls.OUTCOME_SCORE_MAX, score))
+                reward += score
+
+                env.diagnosis_score = score
+                env.recommandation_score = 0.0
+                env.diagnosis_made = True
+
+                env._update_conversation_history(env, candidate_diag, f"[Expert Score] {score}", other_role="expert")
+                env._update_tracking_variables_env(env, response, raw_action, True, True, reward)
+                next_obs[env_idx] = cls.formulate_output(env.render(), True, response)
+                dones[env_idx] = True
 
         return next_obs, dones
 
     @classmethod
     def _batch_llm_inference(cls, llm_worker, tokenizer, prompts: List[Any]):
         """Helper to handle batch inference for both API and vLLM."""
-        # 尝试使用 API 方式 (DataProto non_tensor)
+        if llm_worker is None:
+            return ["" for _ in prompts]
+
+        # 1) 尝试使用 API 方式 (DataProto non_tensor)
         try:
             batch_data = DataProto.from_dict(non_tensor_batch={'prompts': np.array(prompts, dtype=object)})
             output = llm_worker.generate_responses(batch_data)
@@ -420,9 +582,26 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
             if output.non_tensor_batch.get('responses') is not None:
                 return output.non_tensor_batch['responses'].tolist()
         except Exception:
-            pass # 如果失败，尝试 vLLM 逻辑
+            pass
 
-        # vLLM 逻辑 (Tokenization)
+        # 2) 兼容：某些外部 API worker 直接接收 list[str]/list[messages]
+        #    并返回 list[str] 或 (list[str], ...) 等结构
+        try:
+            output = llm_worker.generate_responses(prompts)
+            if isinstance(output, list):
+                # 直接就是 list[str]
+                return output
+            if isinstance(output, tuple) and len(output) > 0 and isinstance(output[0], list):
+                return output[0]
+            # 兼容：返回 DataProto 但字段名不同
+            if hasattr(output, 'non_tensor_batch') and getattr(output, 'non_tensor_batch', None):
+                if output.non_tensor_batch.get('responses') is not None:
+                    return output.non_tensor_batch['responses'].tolist()
+        except Exception:
+            pass
+
+        # 3) vLLM 逻辑 (Tokenization)
+
         str_prompts = []
         for p in prompts:
             if isinstance(p, list): # messages format
@@ -430,6 +609,9 @@ class MedicalConsultationEnvWithPatientLLMandRM(MedicalConsultationEnvWithPatien
             else:
                 str_prompts.append(str(p))
                 
+        if tokenizer is None:
+            raise ValueError("tokenizer is required for local/vLLM inference, but got None")
+
         tokenizer.padding_side = 'left'
         batch_encodings = tokenizer(str_prompts, padding=True, truncation=True, return_tensors='pt')
         position_ids = compute_position_id_with_mask(batch_encodings['attention_mask'])

@@ -160,6 +160,7 @@ class MedicalConsultationEnvWithPatientLLM(MedicalConsultationEnv):
                     'target': item['ground_truth'],
                     'patient_information': item['patient_information'],
                     'description': item['enhanced_description'],
+                    'assistant_description': item.get('assistant_description', ""),
                 }
             )
 
@@ -182,6 +183,7 @@ class MedicalConsultationEnvWithPatientLLM(MedicalConsultationEnv):
         self.index = self._shared_seed_to_index[seed]
         # self.candidate_questions = self._shared_data[self.index]['patient_information']
         self.description = self._shared_data[self.index]['description']
+        self.assistant_description = self._shared_data[self.index].get('assistant_description', "")
         # 过滤一下self.candidate_questions，保留'patient_response'和'doctor_question'同时存在的
         # self.candidate_questions = [q for q in self.candidate_questions if "patient_response" in q and "doctor_question" in q and isinstance(q['patient_response'], np.ndarray) and isinstance(q['doctor_question'], np.ndarray)]
         # self.visited_questions = []  # index of the visited questions
